@@ -3,7 +3,34 @@ Convenience decorators for use in fabfiles.
 """
 
 from functools import wraps
-from types import StringTypes
+from fabric.utils import warn
+
+
+def task(*args, **kwargs):
+    """Decorate an object as being a fabric command task."""
+    task.used = 1
+    display = kwargs.get('display', 1)
+    if args:
+        if hasattr(args[0], '__call__'):
+            func = args[0]
+            func.__fabtask__ = 1
+            if not display:
+                func.__hide__ = 1
+            return func
+        ctx = args
+        if len(ctx) == 1 and not isinstance(ctx[0], basestring):
+            ctx = tuple(args[0])
+    else:
+        ctx = ()
+    def __task(__func):
+        __func.__ctx__ = ctx
+        __func.__fabtask__ = 1
+        if not display:
+            __func.__hide__ = 1
+        return __func
+    return __task
+
+task.used = None
 
 
 def hosts(*host_list):
@@ -30,15 +57,12 @@ def hosts(*host_list):
         instead of requiring ``@hosts(*iterable)``.
     """
     def attach_hosts(func):
-        @wraps(func)
-        def inner_decorator(*args, **kwargs):
-            return func(*args, **kwargs)
         _hosts = host_list
         # Allow for single iterable argument as well as *args
-        if len(_hosts) == 1 and not isinstance(_hosts[0], StringTypes):
+        if len(_hosts) == 1 and not isinstance(_hosts[0], basestring):
             _hosts = _hosts[0]
-        inner_decorator.hosts = list(_hosts)
-        return inner_decorator
+        func.hosts = list(_hosts)
+        return func
     return attach_hosts
 
 
@@ -70,19 +94,20 @@ def roles(*role_list):
         `~fabric.decorators.hosts`).
     """
     def attach_roles(func):
-        @wraps(func)
-        def inner_decorator(*args, **kwargs):
-            return func(*args, **kwargs)
         _roles = role_list
         # Allow for single iterable argument as well as *args
-        if len(_roles) == 1 and not isinstance(_roles[0], StringTypes):
+        if len(_roles) == 1 and not isinstance(_roles[0], basestring):
             _roles = _roles[0]
-        inner_decorator.roles = list(_roles)
-        return inner_decorator
+        func.roles = list(_roles)
+        return func
     return attach_roles
 
 
 def runs_once(func):
+    warn("The runs_once spelling is deprecated, use run_once instead.")
+    return run_once(func)
+
+def run_once(func):
     """
     Decorator preventing wrapped function from running more than once.
 

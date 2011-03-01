@@ -2,16 +2,16 @@
 Classes and subroutines dealing with network connections and related topics.
 """
 
-from functools import wraps
 import getpass
 import re
-import threading
-import select
 import socket
 import sys
 
-from fabric.utils import abort
+from functools import wraps
+
 from fabric.auth import get_password, set_password
+from fabric.state import env, output
+from fabric.utils import abort
 
 try:
     import warnings
@@ -19,7 +19,6 @@ try:
     import paramiko as ssh
 except ImportError:
     abort("paramiko is a required module. Please install it:\n\t$ sudo easy_install paramiko")
-
 
 
 host_pattern = r'((?P<user>[^@]+)@)?(?P<host>[^:]+)(:(?P<port>\d+))?'
@@ -72,13 +71,25 @@ class HostConnectionCache(dict):
         return dict.__delitem__(self, join_host_strings(*normalize(key)))
 
 
+#
+# Host connection dict/cache
+#
+
+connections = HostConnectionCache()
+
+def default_channel():
+    """
+    Return a channel object based on ``env.host_string``.
+    """
+    return connections[env.host_string].get_transport().open_session()
+
+
 def normalize(host_string, omit_port=False):
     """
     Normalizes a given host string, returning explicit host, user, port.
 
     If ``omit_port`` is given and is True, only the host and user are returned.
     """
-    from fabric.state import env
     # Gracefully handle "empty" input by returning empty output
     if not host_string:
         return ('', '') if omit_port else ('', '', '')
@@ -100,7 +111,6 @@ def denormalize(host_string):
     If the user part is the default user, it is removed; if the port is port 22,
     it also is removed.
     """
-    from state import env
     r = host_regex.match(host_string).groupdict()
     user = ''
     if r['user'] is not None and r['user'] != env.user:
@@ -131,7 +141,6 @@ def connect(user, host, port):
     """
     Create and return a new SSHClient instance connected to given host.
     """
-    from state import env
 
     #
     # Initialization
@@ -222,7 +231,7 @@ def connect(user, host, port):
                 # which one raised the exception. Best not to try.
                 prompt = "[%s] Passphrase for private key"
                 text = prompt % env.host_string
-            password = prompt_for_password(text)
+            password = prompt_for_password(text, user=user)
             # Update env.password, env.passwords if empty
             set_password(password)
         # Ctrl-D / Ctrl-C for exit
@@ -243,7 +252,7 @@ def connect(user, host, port):
                 host, e[1])
             )
 
-def prompt_for_password(prompt=None, no_colon=False, stream=None):
+def prompt_for_password(prompt=None, no_colon=False, stream=None, user=None):
     """
     Prompts for and returns a new password if required; otherwise, returns None.
 
@@ -259,20 +268,22 @@ def prompt_for_password(prompt=None, no_colon=False, stream=None):
     ``stream`` is the stream the prompt will be printed to; if not given,
     defaults to ``sys.stderr``.
     """
-    from fabric.state import env
     stream = stream or sys.stderr
     # Construct prompt
-    default = "[%s] Login password" % env.host_string
+    if user:
+        default = "[%s] Login password for user %s" % (env.host_string, user)
+    else:
+        default = "[%s] Login password" % env.host_string
     password_prompt = prompt if (prompt is not None) else default
     if not no_colon:
         password_prompt += ": "
     # Get new password value
     new_password = getpass.getpass(password_prompt, stream)
-    # Otherwise, loop until user gives us a non-empty password (to prevent
-    # returning the empty string, and to avoid unnecessary network overhead.)
+    attempts = 1
     while not new_password:
-        print("Sorry, you can't enter an empty password. Please try again.")
-        password_prompt = base_password_prompt + ": "
+        attempts += 1
+        if attempts > 3:
+            abort("Too many login attempts.")
         new_password = getpass.getpass(password_prompt, stream)
     return new_password
 
@@ -295,7 +306,6 @@ def needs_host(func):
     commands, this decorator will also end up prompting the user once per
     command (in the case where multiple commands have no hosts set, of course.)
     """
-    from fabric.state import env
     @wraps(func)
     def host_prompting_wrapper(*args, **kwargs):
         while not env.get('host_string', False):
@@ -315,7 +325,6 @@ def interpret_host_string(host_string):
 
     Returns the parts as split out by ``normalize`` for convenience.
     """
-    from fabric.state import env
     username, hostname, port = normalize(host_string)
     env.host_string = host_string
     env.host = hostname
@@ -331,12 +340,21 @@ def disconnect_all():
     Used at the end of ``fab``'s main loop, and also intended for use by
     library users.
     """
-    from fabric.state import connections, output
     # Explicitly disconnect from all servers
+    if env.colors:
+        color = env.color_settings['finish']
+    else:
+        color = None
     for key in connections.keys():
         if output.status:
-            print "Disconnecting from %s..." % denormalize(key),
+            msg = "Disconnecting from %s..." % denormalize(key)
+            if color:
+                msg = color(msg)
+            print msg,
         connections[key].close()
         del connections[key]
         if output.status:
-            print "done."
+            if color:
+                print color("done.")
+            else:
+                print "done."

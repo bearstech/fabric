@@ -4,9 +4,10 @@ Internal shared-state variables such as config settings and host lists.
 
 import os
 import sys
+
 from optparse import make_option
 
-from fabric.network import HostConnectionCache
+from fabric.colors import blue, cyan, green, red, yellow
 from fabric.version import get_version
 
 
@@ -25,26 +26,18 @@ win32 = (sys.platform == 'win32')
 # Environment dictionary - support structures
 # 
 
-class _AttributeDict(dict):
+class AttributeDict(dict):
     """
     Dictionary subclass enabling attribute lookup/assignment of keys/values.
 
     For example::
 
-        >>> m = _AttributeDict({'foo': 'bar'})
+        >>> m = AttributeDict({'foo': 'bar'})
         >>> m.foo
         'bar'
         >>> m.foo = 'not bar'
         >>> m['foo']
         'not bar'
-
-    ``_AttributeDict`` objects also provide ``.first()`` which acts like
-    ``.get()`` but accepts multiple keys as arguments, and returns the value of
-    the first hit, e.g.::
-
-        >>> m = _AttributeDict({'foo': 'bar', 'biz': 'baz'})
-        >>> m.first('wrong', 'incorrect', 'foo', 'biz')
-        'bar'
 
     """
     def __getattr__(self, key):
@@ -57,11 +50,31 @@ class _AttributeDict(dict):
     def __setattr__(self, key, value):
         self[key] = value
 
-    def first(self, *names):
-        for name in names:
-            value = self.get(name)
-            if value:
-                return value
+
+class _EnvDict(AttributeDict):
+    """Environment dictionary object."""
+
+    def __getattr__(self, key):
+        if key.isupper():
+            dct = self.__dict__
+            if '_env_mgr' not in dct:
+                from fabric.context_managers import EnvManager
+                dct['_env_mgr'] = EnvManager
+            return dct['_env_mgr'].for_var(key)
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key)
+
+    def __call__(self, *args, **kwargs):
+        dct = self.__dict__
+        if '_ctx_class' not in dct:
+            if 'get_settings' not in env:
+                from fabric.contrib.tav import get_settings
+                env.get_settings = get_settings
+            from fabric.context import ContextRunner
+            dct['_ctx_class'] = ContextRunner
+        return dct['_ctx_class'](*args, **kwargs)
 
 
 # By default, if the user (including code using Fabric as a library) doesn't
@@ -218,25 +231,42 @@ env_options = [
 # Most default values are specified in `env_options` above, in the interests of
 # preserving DRY: anything in here is generally not settable via the command
 # line.
-env = _AttributeDict({
+env = _EnvDict({
     'again_prompt': 'Sorry, try again.',
     'all_hosts': [],
+    'colors': False,
+    'color_settings': {
+        'abort': yellow,
+        'error': yellow,
+        'finish': cyan,
+        'host_prefix': green,
+        'prefix': red,
+        'prompt': blue,
+        'task': red,
+        'warn': yellow
+        },
     'combine_stderr': True,
     'command': None,
     'command_prefixes': [],
+    'config_file': None,
+    'ctx': (),
     'cwd': '', # Must be empty string, not None, for concatenation purposes
     'echo_stdin': True,
+    'format': False,
+    'hook': None,
     'host': None,
     'host_string': None,
-    'lcwd': '', # Must be empty string, not None, for concatenation purposes
     'local_user': _get_system_username(),
+    'multirun_child_timeout': 10,
+    'multirun_pool_size': 10,
     'passwords': {},
     'path': '',
     'path_behavior': 'append',
     'port': None,
     'real_fabfile': None,
     'roledefs': {},
-    'roledefs': {},
+    'shell_history_file': '~/.fab-shell-history',
+    'state': None,
     # -S so sudo accepts passwd via stdin, -p with our known-value prompt for
     # later detection (thus %s -- gets filled with env.sudo_prompt at runtime)
     'sudo_prefix': "sudo -S -p '%s' ",
@@ -261,25 +291,12 @@ commands = {}
 
 
 #
-# Host connection dict/cache
-#
-
-connections = HostConnectionCache()
-
-def default_channel():
-    """
-    Return a channel object based on ``env.host_string``.
-    """
-    return connections[env.host_string].get_transport().open_session()
-
-
-#
 # Output controls
 #
 
-class _AliasDict(_AttributeDict):
+class _AliasDict(AttributeDict):
     """
-    `_AttributeDict` subclass that allows for "aliasing" of keys to other keys.
+    `AttributeDict` subclass that allows for "aliasing" of keys to other keys.
 
     Upon creation, takes an ``aliases`` mapping, which should map alias names
     to lists of key names. Aliases do not store their own value, but instead
@@ -313,7 +330,7 @@ class _AliasDict(_AttributeDict):
             init(arg)
         else:
             init()
-        # Can't use super() here because of _AttributeDict's setattr override
+        # Can't use super() here because of AttributeDict's setattr override
         dict.__setattr__(self, 'aliases', aliases)
 
     def __setitem__(self, key, value):

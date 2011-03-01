@@ -1,12 +1,10 @@
-from __future__ import with_statement
-
 import sys
+
 from select import select
 
-from fabric.context_managers import settings, char_buffered
-from fabric.state import env, output, win32
 from fabric.auth import get_password, set_password
-import fabric.network
+from fabric.network import prompt_for_password
+from fabric.state import env, output, win32
 
 if win32:
     import msvcrt
@@ -32,6 +30,9 @@ def output_loop(chan, which, capture):
     else:
         prefix = "err"
         pipe = sys.stderr
+    host_prefix = "[%s]" % env.host_string
+    if env.colors:
+        host_prefix = env.color_settings['host_prefix'](host_prefix)
     printing = getattr(output, 'stdout' if (which == 'recv') else 'stderr')
     # Initialize loop variables
     reprompt = False
@@ -50,7 +51,7 @@ def output_loop(chan, which, capture):
         # Otherwise, we're in run/sudo and need to handle capturing and
         # prompts.
         else:
-            _prefix = "[%s] %s: " % (env.host_string, prefix)
+            _prefix = "%s %s: " % (host_prefix, prefix)
             # Print to user
             if printing:
                 # Initial prefix
@@ -90,7 +91,7 @@ def output_loop(chan, which, capture):
                     # Prompt for, and store, password. Give empty prompt so the
                     # initial display "hides" just after the actually-displayed
                     # prompt from the remote end.
-                    password = fabric.network.prompt_for_password(
+                    password = prompt_for_password(
                         prompt=" ", no_colon=True, stream=pipe
                     )
                     # Update env.password, env.passwords if necessary

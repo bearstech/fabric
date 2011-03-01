@@ -6,6 +6,12 @@ or performing indenting on multiline output.
 import sys
 import textwrap
 
+from fabric.state import env, output
+
+
+Blank = object()
+
+
 def abort(msg):
     """
     Abort execution, print ``msg`` to stderr and exit with error status (1.)
@@ -17,13 +23,17 @@ def abort(msg):
     .. _sys.exit: http://docs.python.org/library/sys.html#sys.exit
     .. _SystemExit: http://docs.python.org/library/exceptions.html#exceptions.SystemExit
     """
-    from fabric.state import output
     if output.aborts:
-        print >> sys.stderr, "\nFatal error: " + str(msg)
-        print >> sys.stderr, "\nAborting."
+        if env.colors:
+            abort_color = env.color_settings['abort']
+            print >> sys.stderr, abort_color("\nFatal error: " + str(msg))
+            print >> sys.stderr, abort_color("\nAborting.")
+        else:
+            print >> sys.stderr, "\nFatal error: " + str(msg)
+            print >> sys.stderr, "\nAborting."
     sys.exit(1)
 
-
+    
 def warn(msg):
     """
     Print warning message, but do not abort execution.
@@ -33,9 +43,12 @@ def warn(msg):
     provided that the ``warnings`` output level (which is active by default) is
     turned on.
     """
-    from fabric.state import output
     if output.warnings:
-        print >> sys.stderr, "\nWarning: %s\n" % msg
+        msg = "\nWarning: %s\n" % msg
+        if env.colors:
+            print >> sys.stderr, env.color_settings['warn'](msg)
+        else:
+            print >> sys.stderr, msg
 
 
 def indent(text, spaces=4, strip=False):
@@ -66,17 +79,15 @@ def indent(text, spaces=4, strip=False):
     return output
 
 
-def puts(text, show_prefix=True, end="\n", flush=False):
+def puts(
+    text, show_prefix=True, end="\n", flush=False, show_host=True, format=Blank
+    ):
     """
     An alias for ``print`` whose output is managed by Fabric's output controls.
 
     In other words, this function simply prints to ``sys.stdout``, but will
     hide its output if the ``user`` :doc:`output level
     </usage/output_controls>` is set to ``False``.
-
-    If ``show_prefix=False``, `puts` will omit the leading ``[hostname]``
-    which it tacks on by default. (It will also omit this prefix if
-    ``env.host_string`` is empty.)
 
     Newlines may be disabled by setting ``end`` to the empty string (``''``).
     (This intentionally mirrors Python 3's ``print`` syntax.)
@@ -87,17 +98,35 @@ def puts(text, show_prefix=True, end="\n", flush=False):
     .. versionadded:: 0.9.2
     .. seealso:: `~fabric.utils.fastprint`
     """
-    from fabric.state import output, env
     if output.user:
-        prefix = ""
-        if env.host_string and show_prefix:
-            prefix = "[%s] " % env.host_string
-        sys.stdout.write(prefix + str(text) + end)
+        if isinstance(show_prefix, basestring):
+            prefix = '[%s] ' % show_prefix
+        else:
+            prefix = ''
+            if show_prefix:
+                show_host = True
+        if show_host and env.host_string:
+            host_prefix = "[%s] " % env.host_string
+        else:
+            host_prefix = ''
+        if env.colors:
+            if prefix:
+                prefix = env.color_settings['prefix'](prefix)
+            if host_prefix:
+                host_prefix = env.color_settings['host_prefix'](host_prefix)
+        text = host_prefix + prefix + str(text) + end
+        if format is Blank:
+            format = env.format
+        if format:
+            text = text.format(**env)
+        sys.stdout.write(text)
         if flush:
             sys.stdout.flush()
 
 
-def fastprint(text, show_prefix=False, end="", flush=True):
+def fastprint(
+    text, show_prefix=False, end="", flush=True, show_host=False, format=Blank
+    ):
     """
     Print ``text`` immediately, without any prefix or line ending.
 
@@ -120,4 +149,4 @@ def fastprint(text, show_prefix=False, end="", flush=True):
     .. versionadded:: 0.9.2
     .. seealso:: `~fabric.utils.puts`
     """
-    return puts(text=text, show_prefix=show_prefix, end=end, flush=flush)
+    return puts(text, show_prefix, end, flush, show_host, format)

@@ -11,24 +11,28 @@ import stat
 import subprocess
 import sys
 import time
-from glob import glob
-from traceback import format_exc
 
 from contextlib import closing
+from glob import glob
+from textwrap import dedent
+from traceback import format_exc
+from uuid import uuid4
 
-from fabric.context_managers import settings, char_buffered
+from fabric.context_managers import char_buffered, hide, show, stringify_env_var
 from fabric.io import output_loop, input_loop
-from fabric.network import needs_host
-from fabric.state import env, connections, output, win32, default_channel
-from fabric.utils import abort, indent, warn, puts
+from fabric.network import connections, default_channel, needs_host
 from fabric.thread_handling import ThreadHandler
-from fabric.sftp import SFTP
+from fabric.state import env, output, win32
+from fabric.utils import abort, indent, fastprint, warn
 
 # For terminal size logic below
 if not win32:
     import fcntl
     import termios
     import struct
+
+
+Blank = object()
 
 
 def _pty_size():
@@ -122,9 +126,9 @@ def require(*keys, **kwargs):
     The optional keyword argument ``used_for`` may be a string, which will be
     printed in the error output to inform users why this requirement is in
     place. ``used_for`` is printed as part of a string similar to::
-
+    
         "Th(is|ese) variable(s) (are|is) used for %s"
-
+        
     so format it appropriately.
 
     The optional keyword argument ``provided_by`` may be a list of functions or
@@ -194,7 +198,7 @@ def prompt(text, key=None, default='', validate=None):
     a trailing space after the ``[foo]``.)
 
     The optional keyword argument ``validate`` may be a callable or a string:
-
+    
     * If a callable, it is called with the user's input, and should return the
       value to be stored on success. On failure, it should raise an exception
       with an exception message, which will be printed to the user.
@@ -208,20 +212,20 @@ def prompt(text, key=None, default='', validate=None):
     hits ``Ctrl-C``).
 
     Examples::
-
+    
         # Simplest form:
         environment = prompt('Please specify target environment: ')
-
+        
         # With default, and storing as env.dish:
         prompt('Specify favorite dish: ', 'dish', default='spam & eggs')
-
+        
         # With validation, i.e. requiring integer input:
         prompt('Please specify process nice level: ', key='nice', validate=int)
-
+        
         # With validation against a regular expression:
         release = prompt('Please supply a release name',
                 validate=r'^\w+-\d+(\.\d+)?$')
-
+    
     """
     # Store previous env value for later display, if necessary
     if key:
@@ -233,7 +237,9 @@ def prompt(text, key=None, default='', validate=None):
     else:
         default_str = " "
     # Construct full prompt string
-    prompt_str = text.strip() + default_str
+    prompt_str = '\n' + text.strip() + default_str
+    if env.colors:
+        prompt_str = env.color_settings['prompt'](prompt_str)
     # Loop until we pass validation
     value = None
     while value is None:
@@ -250,8 +256,13 @@ def prompt(text, key=None, default='', validate=None):
                 except Exception, e:
                     # Reset value so we stay in the loop
                     value = None
-                    print("Validation failed for the following reason:")
-                    print(indent(e.message) + "\n")
+                    msg = (
+                        "Validation failed for the following reason:\n%s"
+                        % indent(e.message)
+                        )
+                    if env.colors:
+                        msg = env.color_settings['error'](msg)
+                    print(msg)
             # String / regex must match and will be empty if validation fails.
             else:
                 # Need to transform regex into full-matching one if it's not.
@@ -261,7 +272,13 @@ def prompt(text, key=None, default='', validate=None):
                     validate += r'$'
                 result = re.findall(validate, value)
                 if not result:
-                    print("Regular expression validation failed: '%s' does not match '%s'\n" % (value, validate))
+                    msg = (
+                        "Regular expression validation failed: '%s' does not match '%s'"
+                        % (value, validate)
+                        )
+                    if env.colors:
+                        msg = env.color_settings['error'](msg)
+                    print(msg)
                     # Reset value so we stay in the loop
                     value = None
     # At this point, value must be valid, so update env if necessary
@@ -272,291 +289,148 @@ def prompt(text, key=None, default='', validate=None):
         warn("overwrote previous env variable '%s'; used to be '%s', is now '%s'." % (
             key, previous_value, value
         ))
+    else:
+        print
     # And return the value, too, just in case someone finds that useful.
     return value
 
 
 @needs_host
-def put(local_path, remote_path, recursive=True, use_sudo=False,
-    mirror_local_mode=False, mode=None):
+def put(local_path, remote_path, mode=None):
     """
     Upload one or more files to a remote host.
-
+    
     ``local_path`` may be a relative or absolute local file path, and may
     contain shell-style wildcards, as understood by the Python ``glob`` module.
     Tilde expansion (as implemented by ``os.path.expanduser``) is also
     performed.
-
-    ``local_path`` may alternately be a file-like object, such as the result of
-    ``open('path')`` or a ``StringIO`` instance. Using a file-like object in
-    this way will naturally cause ``recursive=True`` to be ignored.
-
-    .. note::
-        In this case, `~fabric.operations.put` will attempt to read the entire
-        contents of the file-like object by rewinding it using ``seek`` (and
-        will use ``tell`` afterwards to preserve the previous file position).
-
-    .. note::
-        Use of a file-like object in `~fabric.operations.put`'s ``local_path``
-        argument will cause a temporary file to be utilized due to limitations
-        in our SSH layer's API.
 
     ``remote_path`` may also be a relative or absolute location, but applied to
     the remote host. Relative paths are relative to the remote user's home
     directory, but tilde expansion (e.g. ``~/.ssh/``) will also be performed if
     necessary.
 
-    An empty string, in either path argument, will be replaced by the
-    appropriate end's current working directory.
-
-    ``recursive``, if set to ``True``, will recursively upload any local
-    directories specified in ``local_path``. In this mode, ``remote_path`` must
-    point to a remote directory and not a file.
-
-    While the SFTP protocol (which `put` uses) has no direct ability to upload
-    files to locations not owned by the connecting user, you may specify
-    ``use_sudo=True`` to work around this. When set, this setting causes `put`
-    to upload the local files to a temporary location on the remote end, and
-    then use `sudo` to move them to ``remote_path``.
-
-    In some use cases, it is desirable to force a newly uploaded file to match
-    the mode of its local counterpart (such as when uploading executable
-    scripts). To do this, specify ``mirror_local_mode=True``.
-
-    Alternately, you may use the ``mode`` kwarg to specify an exact mode, in
-    the same vein as ``os.chmod`` or the Unix ``chmod`` command.
-
-    `~fabric.operations.put` will honor `~fabric.context_managers.cd`, so
-    relative values in ``remote_path`` will be prepended by the current remote
-    working directory, if applicable. Thus, for example, the below snippet
-    would attempt to upload to ``/tmp/files/test.txt`` instead of
-    ``~/files/test.txt``::
-
-        with cd('/tmp'):
-            put('/path/to/local/test.txt', 'files')
-
-    Use of `~fabric.context_managers.lcd` will affect ``local_path`` in the
-    same manner.
-
+    By default, `put` preserves file modes when uploading. However, you can
+    also set the mode explicitly by specifying the ``mode`` keyword argument,
+    which sets the numeric mode of the remote file. See the ``os.chmod``
+    documentation or ``man chmod`` for the format of this argument.
+    
     Examples::
-
+    
         put('bin/project.zip', '/tmp/project.zip')
         put('*.py', 'cgi-bin/')
         put('index.html', 'index.html', mode=0755)
-
-    .. versionchanged:: 1.0
-        Now honors the remote working directory as manipulated by
-        `~fabric.context_managers.cd`, and the local working directory as
-        manipulated by `~fabric.context_managers.lcd`.
-    .. versionchanged:: 1.0
-        Now allows file-like objects in the ``local_path`` argument.
+    
     """
-    # Handle empty local path
-    if not local_path:
-        local_path = os.getcwd()
-
-    # Test whether local_path is a path or a file-like object
-    local_is_path = not (hasattr(local_path, 'read') \
-        and callable(local_path.read))
-
-    ftp = SFTP(env.host_string)
-
+    ftp = connections[env.host_string].open_sftp()
     with closing(ftp) as ftp:
         # Expand tildes (assumption: default remote cwd is user $HOME)
-        home = ftp.normalize('.')
-
-        # Empty remote path implies cwd
-        if not remote_path:
-            remote_path = home
-
-        # Honor cd() (assumes Unix style file paths on remote end)
-        if not os.path.isabs(remote_path) and env.get('cwd'):
-            remote_path = env.cwd.rstrip('/') + '/' + remote_path
-
-        if local_is_path:
-            # Also expand local paths
-            local_path = os.path.expanduser(local_path)
-
-            # Glob local path
-            names = glob(local_path)
-        else:
-            names = [local_path]
-
-        # Sanity check and wierd cases
-        if ftp.exists(remote_path):
-            if recursive and local_is_path and len(names) != 1 and \
-                    not ftp.isdir(remote_path):
-                raise ValueError("'%s' is not a directory" % remote_path)
-
+        remote_path = remote_path.replace('~', ftp.normalize('.'))
+        # Get remote mode for directory-vs-file detection
+        try:
+            rmode = ftp.lstat(remote_path).st_mode
+        except:
+            # sadly, I see no better way of doing this
+            rmode = None
+        # Expand local tildes and get globs
+        globs = glob(os.path.expanduser(local_path))
+        # Deal with bad local_path
+        if not globs:
+            raise ValueError, "'%s' is not a valid local path or glob." \
+                % local_path
+    
         # Iterate over all given local files
-        for lpath in names:
+        for lpath in globs:
+            # If remote path is directory, tack on the local filename
+            _remote_path = remote_path
+            if rmode is not None and stat.S_ISDIR(rmode):
+                _remote_path = os.path.join(
+                    remote_path,
+                    os.path.basename(lpath)
+                )
+            # Print
+            if output.running:
+                prefix = "[%s] " % env.host_string
+                msg = "put: %s -> %s" % (lpath, _remote_path)
+                if env.colors:
+                    prefix = env.color_settings['host_prefix'](prefix)
+                print(prefix + msg)
+            # Try to catch raised exceptions (which is the only way to tell if
+            # this operation had problems; there's no return code) during upload
             try:
-                if local_is_path and os.path.isdir(lpath):
-                    if not recursive:
-                        warn('Skipping directory %s (recursive=False)' % lpath)
-                    else:
-                        ftp.put_dir(lpath, remote_path, use_sudo,
-                            mirror_local_mode, mode)
-                else:
-                    ftp.put(lpath, remote_path, use_sudo, mirror_local_mode,
-                        mode, local_is_path)
+                # Actually do the upload
+                rattrs = ftp.put(lpath, _remote_path)
+                # and finally set the file mode
+                lmode = mode or os.stat(lpath).st_mode
+                if lmode != rattrs.st_mode:
+                    ftp.chmod(_remote_path, lmode)
             except Exception, e:
                 msg = "put() encountered an exception while uploading '%s'"
                 _handle_failure(message=msg % lpath, exception=e)
 
 
 @needs_host
-def get(remote_path, local_path, recursive=False):
+def get(remote_path, local_path):
     """
-    Download one or more files from a remote host.
+    Download a file from a remote host.
+    
+    ``remote_path`` should point to a specific file, while ``local_path`` may
+    be a directory (in which case the remote filename is preserved) or
+    something else (in which case the downloaded file is renamed). Tilde
+    expansion is performed on both ends.
 
-    ``remote_path`` is the remote file path to download, which may contain
-    shell glob syntax, e.g. ``"/var/log/apache2/*.log"``, provided
-    ``local_path`` points to a directory and not a file.
+    For example, ``get('~/info.txt', '/tmp/')`` will create a new file,
+    ``/tmp/info.txt``, because ``/tmp`` is a directory. However, a call such as
+    ``get('~/info.txt', '/tmp/my_info.txt')`` would result in a new file named
+    ``/tmp/my_info.txt``, as that path didn't exist (and thus wasn't a
+    directory.)
 
-    ``local_path`` is the local file path where the downloaded file will be
-    stored. Like traditional ``cp``, it may be a directory or file path and
-    will behave accordingly: ``get(remote_file_name, local_directory)`` will
-    result in creating (or overwriting!) ``local_directory/remote_file_name``,
-    and so forth. This will also work for renaming files while downloading, if
-    you specify a ``local_path`` which does not currently exist.
+    If ``local_path`` names a file that already exists locally, that file
+    will be overwritten without complaint.
 
-    ``local_path`` may alternately be a file-like object, such as the result of
-    ``open('path', 'w')`` or a ``StringIO`` instance. Using a file-like object
-    in this way will naturally cause ``recursive=True`` to be ignored.
-
-    .. note::
-        This function will use ``seek`` and ``tell`` to overwrite the entire
-        contents of the file-like object, in order to be consistent with the
-        behavior of `~fabric.operations.put` (which also considers the entire
-        file). However, unlike `~fabric.operations.put`, the file pointer will
-        not be restored to its previous location, as that doesn't make as much
-        sense here.
-
-    .. note::
-        Due to how our SSH layer works, a temporary file will still be written
-        to your hard disk even if you specify a file-like object such as a
-        StringIO for the ``local_path`` argument. Cleanup is performed,
-        however -- we just note this for users expecting straight-to-memory
-        transfers. (We hope to patch our SSH layer in the future to enable true
-        straight-to-memory downloads.)
-
-    Tilde expansion is performed on both arguments, and an empty string in
-    either slot will be expanded to the appropriate current working directory
-    (so e.g. ``get('/var/log/syslog', '')`` would implicitly have a
-    ``local_path`` of ``"$HOME/syslog"``).
-
-    If set to ``True``, ``recursive`` will cause recursive downloading of
-    ``remote_path``, assuming of course that ``remote_path`` is a directory or
-    a glob which resolves to one or more directories. Naturally,
-    ``local_path`` may not be an existing non-directory file when operating
-    in this mode.
-
-    `~fabric.operations.get` will honor `~fabric.context_managers.cd`, so
-    relative values in ``remote_path`` will be prepended by the current remote
-    working directory, if applicable. Thus, for example, the below snippet
-    would attempt to download ``/tmp/files/test.txt`` instead of
-    ``~/files/test.txt``::
-
-        with cd('/tmp'):
-            get('files/test.txt', '/path/to/local/files/')
-
-    Use of `~fabric.context_managers.lcd` will affect ``local_path`` in the
-    same manner.
-
-    When `get` detects that it will be run on more than one host, it
+    Finally, if `get` detects that it will be run on more than one host, it
     will suffix the current host string to the local filename, to avoid
     clobbering when it is run multiple times.
 
     For example, the following snippet will produce two files on your local
     system, called ``server.log.host1`` and ``server.log.host2`` respectively::
-
+   
         @hosts('host1', 'host2')
         def my_download_task():
             get('/var/log/server.log', 'server.log')
 
-    .. note::
-        Host strings containing usernames will be suffixed as expected, e.g.
-        ``filename.username@hostname``. However, port numbers -- which are
-        usually specified with a colon -- will be specified with a dash
-        instead, for compatibility with some filesystems, so e.g.
-        ``filename.hostname-222`` for a host string of ``"hostname:222"``.
-
-    .. versionchanged:: 1.0
-        Now honors the remote working directory as manipulated by
-        `~fabric.context_managers.cd`, and the local working directory as
-        manipulated by `~fabric.context_managers.lcd`.
-    .. versionchanged:: 1.0
-        Now allows file-like objects in the ``local_path`` argument.
+    However, with a single host (e.g. ``@hosts('host1')``), no suffixing is
+    performed, leaving you with a single, pristine ``server.log``.
     """
-    # Handle empty local path
-    if not local_path:
-        local_path = os.getcwd()
-
-    # Test whether local_path is a path or a file-like object
-    local_is_path = not (hasattr(local_path, 'write') \
-        and callable(local_path.write))
-
-    ftp = SFTP(env.host_string)
-
+    ftp = connections[env.host_string].open_sftp()
     with closing (ftp) as ftp:
-        # Expand home directory markers (tildes, etc)
-        if remote_path.startswith('~'):
-            remote_path = remote_path.replace('~', ftp.normalize('.'), 1)
-        if local_is_path:
-            local_path = os.path.expanduser(local_path)
-
-        # Honor cd() (assumes Unix style file paths on remote end)
-        if not os.path.isabs(remote_path) and env.get('cwd'):
-            remote_path = env.cwd.rstrip('/') + '/' + remote_path
-
+        # Expand tildes (assumption: default remote cwd is user $HOME)
+        remote_path = remote_path.replace('~', ftp.normalize('.'))
+        local_path = os.path.expanduser(local_path)
+        # Detect local directory and append filename if necessary (assuming
+        # Unix file separators for now :()
+        if os.path.isdir(local_path):
+            remote_file = remote_path
+            if '/' in remote_file:
+                remote_file = remote_file.split('/')[-1]
+            local_path = os.path.join(local_path, remote_file)
         # If the current run appears to be scheduled for multiple hosts,
         # append a suffix to the downloaded file to prevent clobbering.
         if len(env.all_hosts) > 1:
-            # Use host_string instead of host for maximum granularity,
-            # translating the port colon into a dash to prevent problems on
-            # some filesystems.
-            label = env.host_string.replace(':', '-')
-            if local_is_path:
-                if os.path.isdir(local_path):
-                    local_path = os.path.join(local_path, label)
-                    # Create directory if it doesn't exist. (Not recursively,
-                    # though -- that's a bit much.
-                    if not os.path.exists(local_path):
-                        os.mkdir(local_path)
-                else:
-                    local_path = local_path + "." + label
-
-        # Glob remote path
-        names = ftp.glob(remote_path)
-        # Sanity check for globbed remote path to non-directory local path
-        if len(names) > 1:
-            err = None
-            if local_is_path:
-                if os.path.exists(local_path) and not os.path.isdir(local_path):
-                    err = "[%s] %s not a directory, but multiple files to be fetched" % (env.host, local_path)
-            else:
-                err = "[%s] Cannot fetch multiple remote files to local file-like object, must give directory path." % env.host
-            if err:
-                raise ValueError(err)
-
-        for remote_path in names:
-            try:
-                if ftp.isdir(remote_path):
-                    if recursive:
-                        ftp.get_dir(remote_path, local_path)
-                    else:
-                        warn("[%s] %s is a directory but recursive=False, skipping" % \
-                            (env.host_string, remote_path))
-                else:
-                    result = ftp.get(remote_path, local_path, local_is_path)
-                    if not local_is_path:
-                        # Overwrite entire contents of local_path
-                        local_path.seek(0)
-                        local_path.write(result)
-            except Exception, e:
-                msg = "get() encountered an exception while downloading '%s'"
-                _handle_failure(message=msg % remote_path, exception=e)
+            local_path = local_path + '.' + env.host
+        # Print
+        if output.running:
+            prefix = "[%s] " % env.host_string
+            msg = "download: %s <- %s" % (local_path, remote_path)
+            if env.colors:
+                prefix = env.color_settings['host_prefix'](msg)
+            print(prefix + msg)
+        # Handle any raised exceptions (no return code to inspect here)
+        try:
+            ftp.get(remote_path, local_path)
+        except Exception, e:
+            msg = "get() encountered an exception while downloading '%s'"
+            _handle_failure(message=msg % remote_path, exception=e)
 
 
 def _sudo_prefix(user):
@@ -596,7 +470,7 @@ def _shell_wrap(command, shell=True, sudo_prefix=None):
     return sudo_prefix + shell + command
 
 
-def _prefix_commands(command, which):
+def _prefix_commands(command, dir=None):
     """
     Prefixes ``command`` with all prefixes found in ``env.command_prefixes``.
 
@@ -604,9 +478,7 @@ def _prefix_commands(command, which):
     `~fabric.context_managers.prefix` context manager.
 
     This function also handles a special-case prefix, ``cwd``, used by
-    `~fabric.context_managers.cd`. The ``which`` kwarg should be a string,
-    ``"local"`` or ``"remote"``, which will determine whether ``cwd`` or
-    ``lcwd`` is used.
+    `~fabric.context_managers.cd`.
     """
     # Local prefix list (to hold env.command_prefixes + any special cases)
     prefixes = list(env.command_prefixes)
@@ -615,15 +487,17 @@ def _prefix_commands(command, which):
     # string or lack thereof.
     # Also place it at the front of the list, in case user is expecting another
     # prefixed command to be "in" the current working directory.
-    cwd = env.cwd if which == 'remote' else env.lcwd
-    if cwd:
-        prefixes.insert(0, 'cd %s' % cwd)
+    if dir:
+        dir = dir.replace(' ', r'\ ')
+        prefixes.append('cd %s' % dir)
+    if env.cwd:
+        prefixes.insert(0, 'cd %s' % env.cwd)
     glue = " && "
     prefix = (glue.join(prefixes) + glue) if prefixes else ""
     return prefix + command
 
 
-def _prefix_env_vars(command):
+def _prefix_env_vars(command, stringify_env_var=stringify_env_var):
     """
     Prefixes ``command`` with any shell environment vars, e.g. ``PATH=foo ``.
 
@@ -634,13 +508,20 @@ def _prefix_env_vars(command):
     path = env.path
     if path:
         if env.path_behavior == 'append':
-            path = 'PATH=$PATH:\"%s\" ' % path
+            path = 'export PATH=$PATH:\"%s\" && ' % path
         elif env.path_behavior == 'prepend':
-            path = 'PATH=\"%s\":$PATH ' % path
+            path = 'export PATH=\"%s\":$PATH && ' % path
         elif env.path_behavior == 'replace':
-            path = 'PATH=\"%s\" ' % path
+            path = 'export PATH=\"%s\" && ' % path
     else:
         path = ''
+    env_vars = [
+        'export %s' % stringify_env_var(key[1:])
+        for key in env if key.startswith('$')
+        ]
+    if env_vars:
+        print ' && '.join(env_vars) + ' && ' + path + command
+        return ' && '.join(env_vars) + ' && ' + path + command
     return path + command
 
 
@@ -766,25 +647,34 @@ def open_shell(command=None):
     _execute(default_channel(), command, True, True, True)
 
 
-def _run_command(command, shell=True, pty=True, combine_stderr=True,
-    sudo=False, user=None):
+def _run_command(
+    command, shell=True, pty=True, combine_stderr=True, sudo=False, user=None,
+    dir=None, format=Blank
+    ):
     """
     Underpinnings of `run` and `sudo`. See their docstrings for more info.
     """
+    if format is Blank:
+        format = env.format
+    if format:
+        command = command.format(**env)
     # Set up new var so original argument can be displayed verbatim later.
     given_command = command
     # Handle context manager modifications, and shell wrapping
     wrapped_command = _shell_wrap(
-        _prefix_commands(_prefix_env_vars(command), 'remote'),
+        _prefix_env_vars(_prefix_commands(command, dir)),
         shell,
         _sudo_prefix(user) if sudo else None
     )
     # Execute info line
     which = 'sudo' if sudo else 'run'
+    prefix = "[%s]" % env.host_string
+    if env.colors:
+        prefix = env.color_settings['host_prefix'](prefix)
     if output.debug:
-        print("[%s] %s: %s" % (env.host_string, which, wrapped_command))
+        print("%s %s: %s" % (prefix, which, wrapped_command))
     elif output.running:
-        print("[%s] %s: %s" % (env.host_string, which, given_command))
+        print("%s %s: %s" % (prefix, which, given_command))
 
     # Actual execution, stdin/stdout/stderr handling, and termination
     stdout, stderr, status = _execute(default_channel(), wrapped_command, pty,
@@ -815,7 +705,10 @@ def _run_command(command, shell=True, pty=True, combine_stderr=True,
 
 
 @needs_host
-def run(command, shell=True, pty=True, combine_stderr=True):
+def run(
+    command, shell=True, pty=True, combine_stderr=True, dir=None,
+    format=Blank
+    ):
     """
     Run a shell command on a remote host.
 
@@ -852,23 +745,57 @@ def run(command, shell=True, pty=True, combine_stderr=True):
     separated). For more info, please read :ref:`combine_streams`.
 
     Examples::
-
+    
         run("ls /var/www/")
         run("ls /home/myuser", shell=False)
         output = run('ls /var/www/site1')
-
+    
     .. versionadded:: 1.0
         The ``succeeded`` and ``stderr`` return value attributes, the
         ``combine_stderr`` kwarg, and interactive behavior.
 
     .. versionchanged:: 1.0
         The default value of ``pty`` is now ``True``.
-    """
-    return _run_command(command, shell, pty, combine_stderr)
+    """ # emacs "
+    return _run_command(
+        command, shell, pty, combine_stderr, dir=dir, format=format
+        )
+
+
+DEFAULT_SCRIPT_NAME = 'fab.%s' % uuid4()
+
+def execute(
+    script, name=None, verbose=True, shell=True, pty=True, combine_stderr=True,
+    dir=None
+    ):
+    """Run arbitrary scripts on a remote host."""
+
+    script = dedent(script).strip()
+    if verbose:
+        prefix = "[%s]" % env.host_string
+        if env.colors:
+            prefix = env.color_settings['host_prefix'](prefix)
+        print("%s run: %s" % (prefix, name or script))
+    name = name or DEFAULT_SCRIPT_NAME
+    with hide('running', 'stdout', 'stderr'):
+        run('cat > ' + name + ' << FABEND\n' + script + '\nFABEND\n', dir=dir)
+        run('chmod +x ' + name, dir=dir)
+        try:
+            if verbose > 1:
+                with show('stdout', 'stderr'):
+                    output = run('./' + name, shell, pty, combine_stderr, dir)
+            else:
+                output = run('./' + name, shell, pty, combine_stderr, dir)
+        finally:
+            run('rm ' + name, dir=dir)
+    return output
 
 
 @needs_host
-def sudo(command, shell=True, pty=True, combine_stderr=True, user=None):
+def sudo(
+    command, shell=True, pty=True, combine_stderr=True, user=None, dir=None,
+    format=Blank
+    ):
     """
     Run a shell command on a remote host, with superuser privileges.
 
@@ -882,20 +809,22 @@ def sudo(command, shell=True, pty=True, combine_stderr=True, user=None):
     ``user`` may likewise be a string or an int.
 
     Examples::
-
+    
         sudo("~/install_script.py")
         sudo("mkdir /var/www/new_docroot", user="www-data")
         sudo("ls /home/jdoe", user=1001)
         result = sudo("ls /tmp/")
-
+    
     .. versionchanged:: 1.0
         See the changed and added notes for `~fabric.operations.run`.
     """
-    return _run_command(command, shell, pty, combine_stderr, sudo=True,
-        user=user)
+    return _run_command(
+        command, shell, pty, combine_stderr, sudo=True, user=user,
+        dir=dir, format=format
+        )
 
 
-def local(command, capture=True):
+def local(command, capture=True, dir=None, format=Blank):
     """
     Run a command on the local system.
 
@@ -907,7 +836,7 @@ def local(command, capture=True):
     stdout as a string, and will not print anything to the user. As with `run`
     and `sudo`, this return value exhibits the ``return_code``, ``stderr``,
     ``failed`` and ``succeeded`` attributes. See `run` for details.
-
+    
     .. note::
         `local`'s capturing behavior differs from the default behavior of `run`
         and `sudo` due to the different mechanisms involved: it is difficult to
@@ -923,25 +852,27 @@ def local(command, capture=True):
     ``output.stderr`` will be used to determine what is printed and what is
     discarded.
 
-    `~fabric.operations.local` will honor the `~fabric.context_managers.lcd`
-    context manager, allowing you to control its current working directory
-    independently of the remote end (which honors
-    `~fabric.context_managers.cd`).
-
     .. versionchanged:: 1.0
         Added the ``succeeded`` attribute.
     .. versionchanged:: 1.0
-        Now honors the `~fabric.context_managers.lcd` context manager.
+        Now honors the `~fabric.context_managers.cd` context manager.
     .. versionchanged:: 1.0
         Added the ``stderr`` attribute.
     """
+    if format is Blank:
+        format = env.format
+    if format:
+        command = command.format(**env)
     given_command = command
     # Apply cd(), path() etc
-    wrapped_command = _prefix_commands(_prefix_env_vars(command), 'local')
+    wrapped_command = _prefix_env_vars(_prefix_commands(command, dir))
+    prefix = '[localhost] '
+    if env.colors:
+        prefix = env.color_settings['host_prefix'](prefix)
     if output.debug:
-        print("[localhost] local: %s" % (wrapped_command))
+        print(prefix + ("local: %s" % (wrapped_command)))
     elif output.running:
-        print("[localhost] local: " + given_command)
+        print(prefix + "local: " + given_command)
     # By default, capture both stdout and stderr
     PIPE = subprocess.PIPE
     out_stream = PIPE
@@ -970,7 +901,6 @@ def local(command, capture=True):
     # If we were capturing, this will be a string; otherwise it will be None.
     return out
 
-
 @needs_host
 def reboot(wait):
     """
@@ -987,9 +917,9 @@ def reboot(wait):
     client.close()
     del connections[env.host_string]
     if output.running:
-        puts("Waiting for reboot: ", flush=True, end='')
+        fastprint("Waiting for reboot: ")
         per_tick = 5
         for second in range(int(wait / per_tick)):
-            puts(".", show_prefix=False, flush=True, end='')
+            fastprint(".")
             time.sleep(per_tick)
-        puts("done.\n", show_prefix=False, flush=True)
+        fastprint("done.\n")
