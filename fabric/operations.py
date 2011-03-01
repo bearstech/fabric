@@ -748,6 +748,10 @@ def _execute(channel, command, pty=True, combine_stderr=None,
             rows, cols = _pty_size()
             channel.get_pty(width=cols, height=rows)
 
+        # request agent
+        from paramiko.agent import AgentClientProxy
+        forward = AgentClientProxy(channel)
+
         # Kick off remote command
         if invoke_shell:
             channel.invoke_shell()
