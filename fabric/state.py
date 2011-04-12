@@ -259,6 +259,7 @@ env = _EnvDict({
     'local_user': _get_system_username(),
     'multirun_child_timeout': 10,
     'multirun_pool_size': 10,
+    'output_prefix': True,
     'passwords': {},
     'path': '',
     'path_behavior': 'append',
@@ -371,3 +372,10 @@ output = _AliasDict({
     'everything': ['warnings', 'running', 'user', 'output'],
     'output': ['stdout', 'stderr']
 })
+
+
+#
+# I/O loop sleep parameter (in seconds)
+#
+
+io_sleep = 0.01

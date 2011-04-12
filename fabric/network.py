@@ -21,7 +21,7 @@ except ImportError:
     abort("paramiko is a required module. Please install it:\n\t$ sudo easy_install paramiko")
 
 
-host_pattern = r'((?P<user>[^@]+)@)?(?P<host>[^:]+)(:(?P<port>\d+))?'
+host_pattern = r'((?P<user>.+)@)?(?P<host>[^:]+)(:(?P<port>\d+))?'
 host_regex = re.compile(host_pattern)
 
 
@@ -284,6 +284,7 @@ def prompt_for_password(prompt=None, no_colon=False, stream=None, user=None):
         attempts += 1
         if attempts > 3:
             abort("Too many login attempts.")
+        print("Sorry, you can't enter an empty password. Please try again.")
         new_password = getpass.getpass(password_prompt, stream)
     return new_password
 

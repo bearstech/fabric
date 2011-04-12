@@ -5,8 +5,8 @@ import shutil
 import sys
 import tempfile
 import types
-
 from contextlib import nested
+from StringIO import StringIO
 
 from nose.tools import raises, eq_
 from fudge import with_patched_object
@@ -14,7 +14,7 @@ from fudge import with_patched_object
 from fabric.state import env
 from fabric.operations import require, prompt, _sudo_prefix, _shell_wrap, \
     _shell_escape
-from fabric.api import get, put, hide, cd
+from fabric.api import get, put, hide, show, cd, lcd, local
 from fabric.sftp import SFTP
 
 from utils import *
@@ -78,6 +78,30 @@ def test_require_mixed_state_keys_prints_missing_only():
         err = sys.stderr.getvalue()
         assert 'version' not in err
         assert 'foo' in err
+
+
+@mock_streams('stderr')
+@raises(SystemExit)
+def test_require_iterable_provided_by_key():
+    """
+    When given a provided_by iterable value, require() raises SystemExit
+    """
+    # 'version' is one of the default values, so we know it'll be there
+    def fake_providing_function():
+        pass
+    require('foo', provided_by=[fake_providing_function])
+
+
+@mock_streams('stderr')
+@raises(SystemExit)
+def test_require_noniterable_provided_by_key():
+    """
+    When given a provided_by noniterable value, require() raises SystemExit
+    """
+    # 'version' is one of the default values, so we know it'll be there
+    def fake_providing_function():
+        pass
+    require('foo', provided_by=fake_providing_function)
 
 
 #
@@ -219,6 +243,17 @@ class TestFileTransfers(FabricTest):
     # get()
     #
 
+    @server(files={'/home/user/.bashrc': 'bash!'}, home='/home/user')
+    def test_get_relative_remote_dir_uses_home(self):
+        """
+        get('relative/path') should use remote $HOME
+        """
+        with hide('everything'):
+            # Another if-it-doesn't-error-out-it-passed test; meh.
+            eq_(get('.bashrc', self.path()), [self.path('.bashrc')])
+
+
+
     @server()
     def test_get_single_file(self):
         """
@@ -244,39 +279,91 @@ class TestFileTransfers(FabricTest):
 
 
     @server()
-    def test_get_single_file_recursively(self):
+    def test_get_single_file_in_folder(self):
         """
-        Recursively get() a folder containing one file
+        get() a folder containing one file
         """
         remote = 'folder/file3.txt'
         with hide('everything'):
-            get('folder', self.tmpdir, recursive=True)
+            get('folder', self.tmpdir)
         eq_contents(self.path(remote), FILES[remote])
 
 
     @server()
-    @mock_streams('both')
-    def test_get_folder_non_recursively(self):
+    def test_get_tree(self):
         """
-        get(folder, recursive=False) should warn and skip
+        Download entire tree
         """
-        target = 'folder'
-        remote = 'folder/file3.txt'
-        get(target, self.tmpdir)
-        assert ("%s is a directory" % target) in sys.stderr.getvalue()
-        assert not os.path.exists(self.path(target))
+        with hide('everything'):
+            get('tree', self.tmpdir)
+        leaves = filter(lambda x: x[0].startswith('/tree'), FILES.items())
+        for path, contents in leaves:
+            eq_contents(self.path(path[1:]), contents)
 
 
     @server()
-    def test_get_tree_recursively(self):
+    def test_get_tree_with_implicit_local_path(self):
         """
-        Download entire tree, recursively
+        Download entire tree without specifying a local path
         """
+        dirname = env.host_string.replace(':', '-')
+        try:
+            with hide('everything'):
+                get('tree')
+            leaves = filter(lambda x: x[0].startswith('/tree'), FILES.items())
+            for path, contents in leaves:
+                path = os.path.join(dirname, path[1:])
+                eq_contents(path, contents)
+                os.remove(path)
+        # Cleanup
+        finally:
+            if os.path.exists(dirname):
+                shutil.rmtree(dirname)
+
+
+    @server()
+    def test_get_absolute_path_should_save_relative(self):
+        """
+        get(/x/y) w/ %(path)s should save y, not x/y
+        """
+        lpath = self.path()
+        ltarget = os.path.join(lpath, "%(path)s")
         with hide('everything'):
-            get('tree', self.tmpdir, recursive=True)
-        leaves = filter(lambda x: x[0].startswith('tree'), FILES.items())
-        for path, contents in leaves:
-            eq_contents(self.path(path), contents)
+            get('/tree/subfolder', ltarget)
+        assert self.exists_locally(os.path.join(lpath, 'subfolder'))
+        assert not self.exists_locally(os.path.join(lpath, 'tree/subfolder'))
+
+
+    @server()
+    def test_path_formatstr_nonrecursively_is_just_filename(self):
+        """
+        get(x/y/z) nonrecursively w/ %(path)s should save y, not y/z
+        """
+        lpath = self.path()
+        ltarget = os.path.join(lpath, "%(path)s")
+        with hide('everything'):
+            get('/tree/subfolder/file3.txt', ltarget)
+        assert self.exists_locally(os.path.join(lpath, 'file3.txt'))
+
+
+    @server()
+    @mock_streams('stderr')
+    def _invalid_file_obj_situations(self, remote_path):
+        with settings(hide('running'), warn_only=True):
+            get(remote_path, StringIO())
+        assert_contains('is a glob or directory', sys.stderr.getvalue())
+
+    def test_glob_and_file_object_invalid(self):
+        """
+        Remote glob and local file object is invalid
+        """
+        self._invalid_file_obj_situations('/tree/*')
+
+    def test_directory_and_file_object_invalid(self):
+        """
+        Remote directory and local file object is invalid
+        """
+        self._invalid_file_obj_situations('/tree')
 
 
     @server()
@@ -334,45 +421,27 @@ class TestFileTransfers(FabricTest):
 
     @server(port=2200)
     @server(port=2201)
-    def multi_get(self, target, leaf, remote='file.txt'):
+    def test_get_from_multiple_servers(self):
         ports = [2200, 2201]
-        hosts = map(lambda x: 'localhost:%s' % x, ports)
+        hosts = map(lambda x: '127.0.0.1:%s' % x, ports)
         with settings(all_hosts=hosts):
             for port in ports:
                 with settings(
-                    hide('everything'), host_string='localhost:%s' % port
+                    hide('everything'), host_string='127.0.0.1:%s' % port
                 ):
-                    get(remote, target)
-                if isinstance(leaf, types.StringTypes):
-                    leaf = [leaf]
-                for filepath in leaf:
-                    local_file = self.path(filepath % port)
-                    try:
-                        assert os.path.exists(local_file)
-                    except AssertionError, e:
-                        raise e
-
-    def test_get_from_multiple_servers_to_dir(self):
-        """
-        Multi-server get() should create per-host directories
-        """
-        self.multi_get(self.tmpdir, 'localhost-%s/file.txt')
-
-    def test_get_from_multiple_servers_to_file(self):
-        """
-        Multi-server get() to file should append to filenames
-        """
-        self.multi_get(self.path('file.txt'), 'file.txt.localhost-%s')
-
-    def test_remote_glob_files_get_from_multiple_servers(self):
-        """
-        Multi-server get() with remote globbed files should use host dirs
-        """
-        self.multi_get(
-            self.path(''),
-            ['localhost-%s/file.txt', 'localhost-%s/file2.txt'],
-            '/file*.txt'
-        )
+                    tmp = self.path('')
+                    local_path = os.path.join(tmp, "%(host)s", "%(path)s")
+                    # Top level file
+                    path = 'file.txt'
+                    get(path, local_path)
+                    assert self.exists_locally(os.path.join(
+                        tmp, "127.0.0.1-%s" % port, path
+                    ))
+                    # Nested file
+                    get('tree/subfolder/file3.txt', local_path)
+                    assert self.exists_locally(os.path.join(
+                        tmp, "127.0.0.1-%s" % port, 'file3.txt'
+                    ))
 
 
     @server()
@@ -381,24 +450,40 @@ class TestFileTransfers(FabricTest):
         get() expands empty remote arg to remote cwd
         """
         with hide('everything'):
-            get('', self.tmpdir, recursive=True)
-        # Spot checks
+            get('', self.tmpdir)
+        # Spot checks -- though it should've downloaded the entirety of
+        # server.FILES.
         for x in "file.txt file2.txt tree/file1.txt".split():
             assert os.path.exists(os.path.join(self.tmpdir, x))
 
 
     @server()
-    def test_get_to_empty_directory_uses_cwd(self):
-        """
-        get() expands empty local arg to local cwd
-        """
+    def _get_to_cwd(self, arg):
         path = 'file.txt'
         with hide('everything'):
-            get(path, '')
-        target = os.path.join(os.getcwd(), path)
-        assert os.path.exists(target)
+            get(path, arg)
+        host_dir = os.path.join(
+            os.getcwd(),
+            env.host_string.replace(':', '-'),
+        )
+        target = os.path.join(host_dir, path)
+        try:
+            assert os.path.exists(target)
         # Clean up, since we're not using our tmpdir
-        os.remove(target)
+        finally:
+            shutil.rmtree(host_dir)
+
+    def test_get_to_empty_string_uses_default_format_string(self):
+        """
+        get() expands empty local arg to local cwd + host + file
+        """
+        self._get_to_cwd('')
+
+    def test_get_to_None_uses_default_format_string(self):
+        """
+        get() expands None local arg to local cwd + host + file
+        """
+        self._get_to_cwd(None)
 
 
     @server()
@@ -411,6 +496,66 @@ class TestFileTransfers(FabricTest):
         with hide('everything'):
             get(target, fake_file)
         eq_(fake_file.getvalue(), FILES[target])
+
+
+    @server()
+    def test_get_interpolation_without_host(self):
+        """
+        local formatting should work w/o use of %(host)s when run on one host
+        """
+        with hide('everything'):
+            tmp = self.path('')
+            # dirname, basename
+            local_path = tmp + "/%(dirname)s/foo/%(basename)s"
+            get('/folder/file3.txt', local_path)
+            assert self.exists_locally(tmp + "foo/file3.txt")
+            # path
+            local_path = tmp + "bar/%(path)s"
+            get('/folder/file3.txt', local_path)
+            assert self.exists_locally(tmp + "bar/file3.txt")
+
+
+    @server()
+    def test_get_returns_list_of_local_paths(self):
+        """
+        get() should return an iterable of the local files it created.
+        """
+        d = self.path()
+        with hide('everything'):
+            retval = get('tree', d)
+        files = ['file1.txt', 'file2.txt', 'subfolder/file3.txt']
+        eq_(map(lambda x: os.path.join(d, 'tree', x), files), retval)
+
+
+    @server()
+    def test_get_returns_none_for_stringio(self):
+        """
+        get() should return None if local_path is a StringIO
+        """
+        with hide('everything'):
+            eq_([], get('/file.txt', StringIO()))
+
+
+    @server()
+    def test_get_return_value_failed_attribute(self):
+        """
+        get()'s return value should indicate any paths which failed to download.
+        """
+        with settings(hide('everything'), warn_only=True):
+            retval = get('/doesnt/exist', self.path())
+        eq_(['/doesnt/exist'], retval.failed)
+        assert not retval.succeeded
+
+
+    @server()
+    def test_get_should_not_use_windows_slashes_in_remote_paths(self):
+        """
+        sftp.glob() should always use Unix-style slashes.
+        """
+        with hide('everything'):
+            path = "/tree/file1.txt"
+            sftp = SFTP(env.host_string)
+            eq_(sftp.glob(path), [path])
 
 
 
@@ -448,7 +593,7 @@ class TestFileTransfers(FabricTest):
         with open(local, 'w') as fd:
             fd.write(text)
         with hide('everything'):
-            put(local, '')
+            put(local)
             get('foo.txt', local2)
         eq_contents(local2, text)
 
@@ -466,9 +611,8 @@ class TestFileTransfers(FabricTest):
         with open('file.txt', 'w') as fd:
             fd.write(text)
         with hide('everything'):
-            # Put, recursively, our cwd (which should only contain the file we
-            # just created)
-            put('', '/', recursive=True)
+            # Put our cwd (which should only contain the file we just created)
+            put('', '/')
             # Get it back under a new name (noting that when we use a truly
             # empty put() local call, it makes a directory remotely with the
             # name of the cwd)
@@ -498,6 +642,51 @@ class TestFileTransfers(FabricTest):
         eq_(pointer, fake_file.tell())
 
 
+    @server()
+    @raises(ValueError)
+    def test_put_should_raise_exception_for_nonexistent_local_path(self):
+        """
+        put(nonexistent_file) should raise a ValueError
+        """
+        put('thisfiledoesnotexist', '/tmp')
+
+
+    @server()
+    def test_put_returns_list_of_remote_paths(self):
+        """
+        put() should return an iterable of the remote files it created.
+        """
+        p = 'uploaded.txt'
+        f = self.path(p)
+        with open(f, 'w') as fd:
+            fd.write("contents")
+        with hide('everything'):
+            retval = put(f, p)
+        eq_(retval, [p])
+
+
+    @server()
+    def test_put_returns_list_of_remote_paths_with_stringio(self):
+        """
+        put() should return a one-item iterable when uploading from a StringIO
+        """
+        f = 'uploaded.txt'
+        with hide('everything'):
+            eq_(put(StringIO('contents'), f), [f])
+
+
+    @server()
+    def test_put_return_value_failed_attribute(self):
+        """
+        put()'s return value should indicate any paths which failed to upload.
+        """
+        with settings(hide('everything'), warn_only=True):
+            f = StringIO('contents')
+            retval = put(f, '/nonexistent/directory/structure')
+        eq_(["<StringIO>"], retval.failed)
+        assert not retval.succeeded
+
+
 
     #
     # Interactions with cd()
@@ -508,12 +697,14 @@ class TestFileTransfers(FabricTest):
         """
         put() should honor env.cwd for relative remote paths
         """
-        local = self.path('test.txt')
+        f = 'test.txt'
+        d = '/empty_folder'
+        local = self.path(f)
         with open(local, 'w') as fd:
             fd.write('test')
-        with nested(cd('/tmp'), hide('everything')):
-            put(local, 'test.txt')
-        assert self.exists_remotely('/tmp/test.txt')
+        with nested(cd(d), hide('everything')):
+            put(local, f)
+        assert self.exists_remotely('%s/%s' % (d, f))
 
 
     @server(files={'/tmp/test.txt': 'test'})
@@ -550,3 +741,61 @@ class TestFileTransfers(FabricTest):
         with nested(cd('/tmp'), hide('everything')):
             get('/test.txt', local)
         assert os.path.exists(local)
+
+
+    @server()
+    def test_lcd_should_apply_to_put(self):
+        """
+        lcd() should apply to put()'s local_path argument
+        """
+        f = 'lcd_put_test.txt'
+        d = 'subdir'
+        local = self.path(d, f)
+        os.makedirs(os.path.dirname(local))
+        with open(local, 'w') as fd:
+            fd.write("contents")
+        with nested(lcd(self.path(d)), hide('everything')):
+            put(f, '/')
+        assert self.exists_remotely('/%s' % f)
+
+
+    @server()
+    def test_lcd_should_apply_to_get(self):
+        """
+        lcd() should apply to get()'s local_path argument
+        """
+        d = self.path('subdir')
+        f = 'file.txt'
+        with nested(lcd(d), hide('everything')):
+            get(f, f)
+        assert self.exists_locally(os.path.join(d, f))
+
+
+#
+# local()
+#
+
+# TODO: figure out how to mock subprocess, if it's even possible.
+# For now, simply test to make sure local() does not raise exceptions with
+# various settings enabled/disabled.
+
+def test_local_output_and_capture():
+    for capture in (True, False):
+        for stdout in (True, False):
+            for stderr in (True, False):
+                hides, shows = ['running'], []
+                if stdout:
+                    hides.append('stdout')
+                else:
+                    shows.append('stdout')
+                if stderr:
+                    hides.append('stderr')
+                else:
+                    shows.append('stderr')
+                with nested(hide(*hides), show(*shows)):
+                    d = "local(): capture: %r, stdout: %r, stderr: %r" % (
+                        capture, stdout, stderr
+                    )
+                    local.description = d
+                    yield local, "echo 'foo' >/dev/null", capture
+                    del local.description
