@@ -47,14 +47,18 @@ class SFTP(object):
 
 
     def glob(self, path):
+        from fabric.state import win32
         dirpart, pattern = os.path.split(path)
         rlist = self.ftp.listdir(dirpart)
 
         names = fnfilter([f for f in rlist if not f[0] == '.'], pattern)
+        ret = [path]
         if len(names):
-            return [os.path.join(dirpart, name) for name in names]
-        else:
-            return [path]
+            s = '/'
+            ret = [dirpart.rstrip(s) + s + name.lstrip(s) for name in names]
+            if not win32:
+                ret = [os.path.join(dirpart, name) for name in names]
+        return ret
 
 
     def walk(self, top, topdown=True, onerror=None, followlinks=False):
@@ -102,15 +106,36 @@ class SFTP(object):
             self.ftp.mkdir(path)
 
 
-    def get(self, remote_path, local_path, local_is_path):
-        if local_is_path and os.path.isdir(local_path):
-            local_path = os.path.join(local_path, os.path.basename(remote_path))
+    def get(self, remote_path, local_path, local_is_path, rremote=None):
+        # rremote => relative remote path, so get(/var/log) would result in
+        # this function being called with
+        # remote_path=/var/log/apache2/access.log and
+        # rremote=apache2/access.log
+        rremote = rremote if rremote is not None else remote_path
+        # Handle format string interpolation (e.g. %(dirname)s)
+        path_vars = {
+            'host': env.host_string.replace(':', '-'),
+            'basename': os.path.basename(rremote),
+            'dirname': os.path.dirname(rremote),
+            'path': rremote
+        }
+        if local_is_path:
+            # Interpolate, then abspath (to make sure any /// are compressed)
+            local_path = os.path.abspath(local_path % path_vars)
+            # Ensure we give Paramiko a file by prepending and/or creating
+            # local directories as appropriate.
+            dirpath, filepath = os.path.split(local_path)
+            if dirpath and not os.path.exists(dirpath):
+                os.makedirs(dirpath)
+            if os.path.isdir(local_path):
+                local_path = os.path.join(local_path, path_vars['basename'])
         if output.running:
             print("[%s] download: %s <- %s" % (
                 env.host_string,
                 local_path if local_is_path else "<file obj>",
                 remote_path
             ))
+        # Warn about overwrites, but keep going
         if local_is_path and os.path.exists(local_path):
             msg = "Local file %s already exists and is being overwritten."
             warn(msg % local_path)
@@ -119,39 +144,58 @@ class SFTP(object):
         if not local_is_path:
             fd, real_local_path = tempfile.mkstemp()
         self.ftp.get(remote_path, real_local_path)
-        # Return the contents so the caller can actually take care of stuffing
-        # into the fd
+        # Return file contents (if it needs stuffing into a file-like obj)
+        # or the final local file path (otherwise)
+        result = None
         if not local_is_path:
             file_obj = os.fdopen(fd)
             result = file_obj.read()
-            # Clean up
+            # Clean up temporary file
             file_obj.close()
             os.remove(real_local_path)
-            # Return
-            return result
+        else:
+            result = real_local_path
+        return result
 
 
     def get_dir(self, remote_path, local_path):
+        # Decide what needs to be stripped from remote paths so they're all
+        # relative to the given remote_path
         if os.path.basename(remote_path):
             strip = os.path.dirname(remote_path)
         else:
             strip = os.path.dirname(os.path.dirname(remote_path))
 
+        # Store all paths gotten so we can return them when done
+        result = []
+        # Use our facsimile of os.walk to find all files within remote_path
         for context, dirs, files in self.walk(remote_path):
-            lcontext = context.replace(strip,'')
-            lcontext = lcontext.lstrip('/')
+            # Normalize current directory to be relative
+            # E.g. remote_path of /var/log and current dir of /var/log/apache2
+            # would be turned into just 'apache2'
+            lcontext = rcontext = context.replace(strip, '', 1).lstrip('/')
+            # Prepend local path to that to arrive at the local mirrored
+            # version of this directory. So if local_path was 'mylogs', we'd
+            # end up with 'mylogs/apache2'
             lcontext = os.path.join(local_path, lcontext)
 
-            if not os.path.exists(lcontext):
-                os.mkdir(lcontext)
-            for d in dirs:
-                n = os.path.join(lcontext, d)
-                if not os.path.exists(n):
-                    os.mkdir(n)
+            # Download any files in current directory
             for f in files:
-                remote_path = os.path.join(context, f)
-                n = os.path.join(lcontext, f)
-                self.get(remote_path, n, True)
+                # Construct full and relative remote paths to this file
+                rpath = os.path.join(context, f)
+                rremote = os.path.join(rcontext, f)
+                # If local_path isn't using a format string that expands to
+                # include its remote path, we need to add it here.
+                if "%(path)s" not in local_path \
+                    and "%(dirname)s" not in local_path:
+                    lpath = os.path.join(lcontext, f)
+                # Otherwise, just passthrough local_path to self.get()
+                else:
+                    lpath = local_path
+                # Now we can make a call to self.get() with specific file paths
+                # on both ends.
+                result.append(self.get(rpath, lpath, True, rremote))
+        return result
 
 
     def put(self, local_path, remote_path, use_sudo, mirror_local_mode, mode,
@@ -189,7 +233,8 @@ class SFTP(object):
             local_path.seek(old_pointer)
         rattrs = self.ftp.put(real_local_path, remote_path)
         # Clean up
-        os.remove(real_local_path)
+        if not local_is_path:
+            os.remove(real_local_path)
         # Handle modes if necessary
         if local_is_path and (mirror_local_mode or mode is not None):
             lmode = os.stat(local_path).st_mode if mirror_local_mode else mode
@@ -204,6 +249,9 @@ class SFTP(object):
         if use_sudo:
             with hide('everything'):
                 sudo("mv \"%s\" \"%s\"" % (remote_path, target_path))
+            # Revert to original remote_path for return value's sake
+            remote_path = target_path
+        return remote_path
 
 
     def put_dir(self, local_path, remote_path, use_sudo, mirror_local_mode,
@@ -213,8 +261,10 @@ class SFTP(object):
         else:
             strip = os.path.dirname(os.path.dirname(local_path))
 
+        remote_paths = []
+
         for context, dirs, files in os.walk(local_path):
-            rcontext = context.replace(strip,'')
+            rcontext = context.replace(strip, '', 1)
             rcontext = rcontext.lstrip('/')
             rcontext = os.path.join(remote_path, rcontext)
 
@@ -229,4 +279,7 @@ class SFTP(object):
             for f in files:
                 local_path = os.path.join(context,f)
                 n = os.path.join(rcontext,f)
-                self.put(local_path, n, use_sudo, mirror_local_mode, mode, True)
+                p = self.put(local_path, n, use_sudo, mirror_local_mode, mode,
+                    True)
+                remote_paths.append(p)
+        return remote_paths

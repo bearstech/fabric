@@ -1,7 +1,9 @@
 import sys
-
+import time
 from select import select
 
+from fabric.context_managers import settings, char_buffered
+from fabric.state import env, output, win32, io_sleep
 from fabric.auth import get_password, set_password
 from fabric.network import prompt_for_password
 from fabric.state import env, output, win32
@@ -51,7 +53,10 @@ def output_loop(chan, which, capture):
         # Otherwise, we're in run/sudo and need to handle capturing and
         # prompts.
         else:
-            _prefix = "%s %s: " % (host_prefix, prefix)
+            _prefix = "[%s] %s: " % (env.host_string, prefix)
+            # Allow prefix to be turned off.
+            if not env.output_prefix:
+                _prefix = ""
             # Print to user
             if printing:
                 # Initial prefix
@@ -124,3 +129,4 @@ def input_loop(chan, using_pty):
                 # output level, don't want it to be accidentally hidden
                 sys.stdout.write(byte)
                 sys.stdout.flush()
+        time.sleep(io_sleep)
