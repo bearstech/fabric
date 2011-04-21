@@ -192,11 +192,15 @@ def settings(*args, **kwargs):
 
 def cd(path):
     """
-    Context manager that keeps directory state when calling operations.
+    Context manager that keeps directory state when calling remote operations.
 
     Any calls to `run`, `sudo` or `local` within the wrapped block will
     implicitly have a string similar to ``"cd <path> && "`` prefixed in order
     to give the sense that there is actually statefulness involved.
+
+    .. note::
+        `cd` only affects *remote* paths -- to modify *local* paths, use
+        `~fabric.context_managers.lcd`.
 
     Because use of `cd` affects all such invocations, any code making use of
     `run`/`sudo`/`local`, such as much of the ``contrib`` section, will also be
@@ -240,7 +244,17 @@ def cd(path):
 
         Space characters will be escaped automatically to make dealing with
         such directory names easier.
+
+    .. versionchanged:: 1.0
+        Applies to `get` and `put` in addition to the command-running
+        operations.
+
+    .. seealso:: `~fabric.context_managers.lcd`
     """
+    return _change_cwd('cwd', path)
+
+
+def lcd(path):
     path = path.replace(' ', '\ ')
     if env.get('cwd') and not path.startswith('/'):
         new_cwd = env.cwd + '/' + path
